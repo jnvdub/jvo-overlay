@@ -11,6 +11,7 @@ app = Flask(__name__)
 
 TEMP_DIR = "/tmp/jvo_images"
 os.makedirs(TEMP_DIR, exist_ok=True)
+os.makedirs("/app/models", exist_ok=True)
 
 def find_font(candidates):
     for path in candidates:
@@ -335,6 +336,15 @@ def build_text_overlay_image(w, h, quote_text, reference):
 
     return overlay
 
+MODELS_DIR = "/app/models"
+
+@app.route("/models/<filename>", methods=["GET"])
+def serve_model(filename):
+    filename = os.path.basename(filename)
+    filepath = os.path.join(MODELS_DIR, filename)
+    if not os.path.exists(filepath):
+        return jsonify({"error": "Model not found"}), 404
+    return send_file(filepath, mimetype="application/octet-stream")
 
 @app.route("/image/<filename>", methods=["GET"])
 def serve_image(filename):
