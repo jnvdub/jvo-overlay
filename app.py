@@ -364,7 +364,10 @@ def serve_model(filename):
     if not os.path.exists(filepath):
         return jsonify({"error": "Model not found"}), 404
     return send_file(filepath, mimetype="application/octet-stream")
-
+    
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok"}), 200
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
