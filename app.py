@@ -1,6 +1,8 @@
 from flask import Flask, request, jsonify, send_file
 from PIL import Image, ImageDraw, ImageFont
-import requests
+import requests as req_lib
+import boto3
+from botocore.client import Config
 import io
 import os
 import uuid
@@ -11,7 +13,21 @@ app = Flask(__name__)
 
 TEMP_DIR = "/tmp/jvo_images"
 os.makedirs(TEMP_DIR, exist_ok=True)
-os.makedirs("/app/models", exist_ok=True)
+
+# ── S3 CLIENT ────────────────────────────────────────────────────────────────
+S3_ENDPOINT   = "https://t3.storageapi.dev"
+S3_BUCKET     = "orderly-flask-tlkgjhixwkd"
+S3_ACCESS_KEY = os.environ.get("S3_ACCESS_KEY", "")
+S3_SECRET_KEY = os.environ.get("S3_SECRET_KEY", "")
+
+s3_client = boto3.client(
+    "s3",
+    endpoint_url=S3_ENDPOINT,
+    aws_access_key_id=S3_ACCESS_KEY,
+    aws_secret_access_key=S3_SECRET_KEY,
+    config=Config(signature_version="s3"),
+    region_name="auto"
+)
 
 def find_font(candidates):
     for path in candidates:
@@ -73,7 +89,7 @@ def wrap_text(text, font, max_width, draw):
     return lines
 
 def compose_image(image_url, quote_text, reference):
-    response = requests.get(image_url, timeout=30)
+    response = req_lib.get(image_url, timeout=30)
     response.raise_for_status()
     base_img = Image.open(io.BytesIO(response.content)).convert("RGBA")
     base_img = base_img.resize(CANVAS_SIZE, Image.LANCZOS)
@@ -130,29 +146,21 @@ def compose_image(image_url, quote_text, reference):
 
 
 def make_video(image_url, quote_text, reference):
-    """
-    Memory-efficient video generation using pipe approach:
-    - Frames streamed directly to FFmpeg stdin — no temp files
-    - Process at half resolution (540x960), FFmpeg upscales to 1080x1920
-    - 6fps x 12s = 72 frames total
-    """
     FPS = 24
     TOTAL_SECONDS = 12
     OVERLAY_FPS = 6
-    OVERLAY_FRAMES = TOTAL_SECONDS * OVERLAY_FPS  # 72 frames
+    OVERLAY_FRAMES = TOTAL_SECONDS * OVERLAY_FPS
     PROC_W, PROC_H = 540, 960
     padding = 30
     max_text_width = PROC_W - (padding * 2)
 
-    # Download base image
-    resp = requests.get(image_url, timeout=30)
+    resp = req_lib.get(image_url, timeout=30)
     resp.raise_for_status()
     base_img = Image.open(io.BytesIO(resp.content)).convert("RGB")
     base_img = base_img.resize((540, 540), Image.LANCZOS)
 
     uid = uuid.uuid4().hex
 
-    # Set up fonts at half scale
     dummy = Image.new("RGBA", (PROC_W, PROC_H), (0, 0, 0, 0))
     draw_dummy = ImageDraw.Draw(dummy)
 
@@ -180,11 +188,9 @@ def make_video(image_url, quote_text, reference):
     PANEL_Y = int(PROC_H * 0.53)
     TEXT_START_Y = PANEL_Y + 25
 
-    # Output video path
     video_filename = f"{uid}.mp4"
     video_path = os.path.join(TEMP_DIR, video_filename)
 
-    # Start FFmpeg reading raw RGB frames from stdin
     cmd = [
         "ffmpeg", "-y",
         "-f", "rawvideo",
@@ -206,7 +212,6 @@ def make_video(image_url, quote_text, reference):
 
     try:
         for fi in range(OVERLAY_FRAMES):
-            # Ken Burns zoom at half res
             zoom = 1.0 + (fi / max(OVERLAY_FRAMES - 1, 1)) * 0.06
             zw = int(540 * zoom)
             zoomed = base_img.resize((zw, zw), Image.LANCZOS)
@@ -219,15 +224,12 @@ def make_video(image_url, quote_text, reference):
             ov = Image.new("RGBA", (PROC_W, PROC_H), (0, 0, 0, 0))
             draw = ImageDraw.Draw(ov)
 
-            # Dark gradient panel
             for y in range(PROC_H - PANEL_Y + 100):
                 alpha = int(235 * min(1.0, y / 140))
                 draw.rectangle([(0, PANEL_Y - 100 + y), (PROC_W, PANEL_Y - 99 + y)], fill=(7, 4, 18, alpha))
 
-            # Teal line
             draw.rectangle([(padding, TEXT_START_Y - 9), (PROC_W - padding, TEXT_START_Y - 8)], fill=(*TEAL, 255))
 
-            # Quote lines
             current_y = TEXT_START_Y + 4
             for i, line in enumerate(lines):
                 sf = line_starts[i]
@@ -240,7 +242,6 @@ def make_video(image_url, quote_text, reference):
                 draw.text((x, current_y), line, font=quote_font, fill=(*GOLD, int(255 * ar)))
                 current_y += line_height
 
-            # Reference
             if fi >= ref_start:
                 ar = min(1.0, (fi - ref_start) / max(FADE_F, 1))
                 ref_text = f"— {reference}, KJV"
@@ -249,7 +250,6 @@ def make_video(image_url, quote_text, reference):
                 draw.text((rx + 1, current_y + 10 + 1), ref_text, font=ref_font, fill=(0, 0, 0, int(160 * ar)))
                 draw.text((rx, current_y + 10), ref_text, font=ref_font, fill=(*TEAL, int(255 * ar)))
 
-            # Handle
             if fi >= handle_start:
                 ar = min(1.0, (fi - handle_start) / max(FADE_F, 1))
                 brand = "@only.jesusvibes"
@@ -257,7 +257,6 @@ def make_video(image_url, quote_text, reference):
                 bx = (PROC_W - (bbox[2] - bbox[0])) // 2
                 draw.text((bx, PROC_H - 38), brand, font=brand_font, fill=(255, 255, 255, int(200 * ar)))
 
-            # Composite and pipe raw bytes to FFmpeg
             comp = Image.alpha_composite(fc.convert("RGBA"), ov).convert("RGB")
             proc.stdin.write(comp.tobytes())
 
@@ -277,74 +276,61 @@ def make_video(image_url, quote_text, reference):
     return video_filename
 
 
-def build_text_overlay_image(w, h, quote_text, reference):
-    """Build a PIL RGBA overlay image with text — works on any video dimensions."""
-    overlay = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-    draw = ImageDraw.Draw(overlay)
+# ── ROUTES ───────────────────────────────────────────────────────────────────
 
-    padding = int(w * 0.056)
-    max_text_width = w - (padding * 2)
+@app.route("/compose", methods=["POST"])
+def compose():
+    data = request.json
+    image_url  = data.get("image_url")
+    quote_text = data.get("quote_text", "")
+    reference  = data.get("reference", "")
 
-    font_size = int(w * 0.054)
-    quote_font = load_font(QUOTE_FONT_PATH, font_size)
-    while font_size > int(w * 0.026):
-        quote_font = load_font(QUOTE_FONT_PATH, font_size)
-        lines = wrap_text(f'"{quote_text}"', quote_font, max_text_width, draw)
-        if len(lines) <= 5:
-            break
-        font_size -= 2
+    if not image_url:
+        return jsonify({"error": "image_url required"}), 400
 
-    lines = wrap_text(f'"{quote_text}"', quote_font, max_text_width, draw)
-    line_height = font_size + int(font_size * 0.24)
-    ref_font = load_font(REF_FONT_PATH, int(font_size * 0.76))
-    brand_font = load_font(FALLBACK_FONT_PATH, int(font_size * 0.52))
+    try:
+        uid = uuid.uuid4().hex
+        result = compose_image(image_url, quote_text, reference)
+        filename = f"{uid}.jpg"
+        filepath = os.path.join(TEMP_DIR, filename)
+        result.save(filepath, "JPEG", quality=95)
+        composed_url = f"https://web-production-f5d29.up.railway.app/image/{filename}"
+        return jsonify({"composed_url": composed_url, "filename": filename})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
-    text_start_y = int(h * 0.52)
-    panel_y = text_start_y - int(h * 0.021)
-    teal_line_y = text_start_y - int(h * 0.009)
 
-    # Dark gradient panel
-    for y in range(h - panel_y):
-        alpha = int(220 * min(1.0, y / max(1, h * 0.156)))
-        draw.rectangle([(0, panel_y + y), (w, panel_y + y + 1)], fill=(7, 4, 18, alpha))
+@app.route("/upload", methods=["POST"])
+def upload():
+    """Download a file from a URL and upload it to Railway S3 bucket."""
+    data = request.json
+    url          = data.get("url")
+    filename     = data.get("filename")
+    content_type = data.get("content_type", "image/jpeg")
 
-    # Teal accent line
-    draw.rectangle([(padding, teal_line_y), (w - padding, teal_line_y + 3)], fill=(*TEAL, 255))
+    if not url or not filename:
+        return jsonify({"error": "url and filename required"}), 400
 
-    # Quote lines
-    current_y = text_start_y
-    for line in lines:
-        bbox = draw.textbbox((0, 0), line, font=quote_font)
-        x = (w - (bbox[2] - bbox[0])) // 2
-        draw.text((x + 3, current_y + 3), line, font=quote_font, fill=(0, 0, 0, 180))
-        draw.text((x, current_y), line, font=quote_font, fill=(*GOLD, 255))
-        current_y += line_height
+    try:
+        # Download from source URL
+        response = req_lib.get(url, timeout=60)
+        response.raise_for_status()
 
-    # Reference
-    ref_text = f"— {reference}, KJV"
-    bbox = draw.textbbox((0, 0), ref_text, font=ref_font)
-    ref_x = (w - (bbox[2] - bbox[0])) // 2
-    ref_y = current_y + int(h * 0.010)
-    draw.text((ref_x + 2, ref_y + 2), ref_text, font=ref_font, fill=(0, 0, 0, 180))
-    draw.text((ref_x, ref_y), ref_text, font=ref_font, fill=(*TEAL, 255))
+        # Upload to S3
+        s3_client.put_object(
+            Bucket=S3_BUCKET,
+            Key=filename,
+            Body=response.content,
+            ContentType=content_type,
+            ACL="public-read"
+        )
 
-    # Brand handle
-    brand = "@only.jesusvibes"
-    bbox = draw.textbbox((0, 0), brand, font=brand_font)
-    bx = (w - (bbox[2] - bbox[0])) // 2
-    draw.text((bx, h - int(h * 0.042)), brand, font=brand_font, fill=(255, 255, 255, 160))
+        public_url = f"{S3_ENDPOINT}/{S3_BUCKET}/{filename}"
+        return jsonify({"url": public_url})
 
-    return overlay
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
-MODELS_DIR = "/app/models"
-
-@app.route("/models/<filename>", methods=["GET"])
-def serve_model(filename):
-    filename = os.path.basename(filename)
-    filepath = os.path.join(MODELS_DIR, filename)
-    if not os.path.exists(filepath):
-        return jsonify({"error": "Model not found"}), 404
-    return send_file(filepath, mimetype="application/octet-stream")
 
 @app.route("/image/<filename>", methods=["GET"])
 def serve_image(filename):
@@ -354,6 +340,7 @@ def serve_image(filename):
         return jsonify({"error": "Image not found"}), 404
     return send_file(filepath, mimetype="image/jpeg")
 
+
 @app.route("/video/<filename>", methods=["GET"])
 def serve_video(filename):
     filename = os.path.basename(filename)
@@ -361,6 +348,16 @@ def serve_video(filename):
     if not os.path.exists(filepath):
         return jsonify({"error": "Video not found"}), 404
     return send_file(filepath, mimetype="video/mp4")
+
+
+@app.route("/models/<filename>", methods=["GET"])
+def serve_model(filename):
+    filename = os.path.basename(filename)
+    filepath = os.path.join("/app/models", filename)
+    if not os.path.exists(filepath):
+        return jsonify({"error": "Model not found"}), 404
+    return send_file(filepath, mimetype="application/octet-stream")
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
