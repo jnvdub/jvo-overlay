@@ -302,7 +302,6 @@ def compose():
 
 @app.route("/upload", methods=["POST"])
 def upload():
-    """Download a file from a URL and upload it to Railway S3 bucket."""
     data = request.json
     url          = data.get("url")
     filename     = data.get("filename")
@@ -312,12 +311,20 @@ def upload():
         return jsonify({"error": "url and filename required"}), 400
 
     try:
-        # Download from source URL
+        # Initialise S3 client inside the route — safer for startup
+        s3 = boto3.client(
+            "s3",
+            endpoint_url=S3_ENDPOINT,
+            aws_access_key_id=S3_ACCESS_KEY,
+            aws_secret_access_key=S3_SECRET_KEY,
+            config=Config(signature_version="s3"),
+            region_name="auto"
+        )
+
         response = req_lib.get(url, timeout=60)
         response.raise_for_status()
 
-        # Upload to S3
-        s3_client.put_object(
+        s3.put_object(
             Bucket=S3_BUCKET,
             Key=filename,
             Body=response.content,
