@@ -1,8 +1,6 @@
 from flask import Flask, request, jsonify, send_file
 from PIL import Image, ImageDraw, ImageFont
 import requests as req_lib
-import boto3
-from botocore.client import Config
 import io
 import os
 import uuid
@@ -311,28 +309,60 @@ def upload():
         return jsonify({"error": "url and filename required"}), 400
 
     try:
-        # Initialise S3 client inside the route — safer for startup
-        s3 = boto3.client(
-            "s3",
-            endpoint_url=S3_ENDPOINT,
-            aws_access_key_id=S3_ACCESS_KEY,
-            aws_secret_access_key=S3_SECRET_KEY,
-            config=Config(signature_version="s3v4"),
-            region_name="auto"
-        )
-
+        # Download from source
         response = req_lib.get(url, timeout=60)
         response.raise_for_status()
 
-        s3.put_object(
-            Bucket=S3_BUCKET,
-            Key=filename,
-            Body=response.content,
-            ContentType=content_type,
-            ACL="public-read"
-        )
+        # Upload to S3 using AWS Signature V4
+        import hmac
+        import hashlib
+        from datetime import datetime, timezone
 
-        public_url = f"{S3_ENDPOINT}/{S3_BUCKET}/{filename}"
+        file_content = response.content
+        now = datetime.now(timezone.utc)
+        date_str = now.strftime('%Y%m%d')
+        datetime_str = now.strftime('%Y%m%dT%H%M%SZ')
+
+        host = 't3.storageapi.dev'
+        region = 'auto'
+        service = 's3'
+
+        # Build canonical request
+        content_hash = hashlib.sha256(file_content).hexdigest()
+        canonical_headers = f'content-type:{content_type}\nhost:{host}\nx-amz-acl:public-read\nx-amz-content-sha256:{content_hash}\nx-amz-date:{datetime_str}\n'
+        signed_headers = 'content-type;host;x-amz-acl;x-amz-content-sha256;x-amz-date'
+        canonical_request = f'PUT\n/{S3_BUCKET}/{filename}\n\n{canonical_headers}\n{signed_headers}\n{content_hash}'
+
+        # Build string to sign
+        credential_scope = f'{date_str}/{region}/{service}/aws4_request'
+        string_to_sign = f'AWS4-HMAC-SHA256\n{datetime_str}\n{credential_scope}\n{hashlib.sha256(canonical_request.encode()).hexdigest()}'
+
+        # Calculate signature
+        def sign(key, msg):
+            return hmac.new(key, msg.encode('utf-8'), hashlib.sha256).digest()
+
+        signing_key = sign(sign(sign(sign(f'AWS4{S3_SECRET_KEY}'.encode('utf-8'), date_str), region), service), 'aws4_request')
+        signature = hmac.new(signing_key, string_to_sign.encode('utf-8'), hashlib.sha256).hexdigest()
+
+        authorization = f'AWS4-HMAC-SHA256 Credential={S3_ACCESS_KEY}/{credential_scope}, SignedHeaders={signed_headers}, Signature={signature}'
+
+        headers = {
+            'Content-Type': content_type,
+            'x-amz-acl': 'public-read',
+            'x-amz-content-sha256': content_hash,
+            'x-amz-date': datetime_str,
+            'Authorization': authorization
+        }
+
+        put_response = req_lib.put(
+            f'https://{host}/{S3_BUCKET}/{filename}',
+            data=file_content,
+            headers=headers,
+            timeout=60
+        )
+        put_response.raise_for_status()
+
+        public_url = f'https://{host}/{S3_BUCKET}/{filename}'
         return jsonify({"url": public_url})
 
     except Exception as e:
