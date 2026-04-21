@@ -317,7 +317,7 @@ def upload():
             endpoint_url=S3_ENDPOINT,
             aws_access_key_id=S3_ACCESS_KEY,
             aws_secret_access_key=S3_SECRET_KEY,
-            config=Config(signature_version="s3"),
+            config=Config(signature_version="s3v4"),
             region_name="auto"
         )
 
